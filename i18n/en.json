@@ -1,0 +1,7 @@
+{
+  "mode.internal": "Laptop only",
+  "mode.duplicate": "Duplicate",
+  "mode.extend": "Extend",
+  "mode.external": "Second screen only",
+  "tooltip": "Display mode"
+}

@@ -1,0 +1,17 @@
+# Qt / QML caches and tooling
+*.qmlc
+*.jsc
+.qmlls.ini
+
+# Editors and OS
+*~
+*.swp
+*.bak
+*.bak.*
+.vscode/
+.idea/
+.DS_Store
+
+# Local scratch
+*.log
+*.tmp

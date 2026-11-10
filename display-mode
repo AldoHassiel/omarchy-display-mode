@@ -1,0 +1,438 @@
+#!/bin/bash
+
+set -u
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/aldo-display-mode"
+MODE_FILE="$STATE_DIR/mode"
+STRATEGY_FILE="$STATE_DIR/duplicate-strategy"
+LUA_FILE="$HOME/.config/hypr/display-mode.lua"
+TOGGLES="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/aldo-display-mode.lock"
+SAFE_NAME='^[A-Za-z0-9._-]+$'
+PARKED=20000
+SAVER_CLASS="org.aldo.displaysaver"
+SAVER_WORKSPACE="salvapantallas"
+EXTERNAL_WORKSPACE=2
+SAFE_DESC='^[A-Za-z0-9 ._,:()/+#-]+$'
+
+monitors_json() {
+  hyprctl monitors all -j 2>/dev/null
+}
+
+detect() {
+  MONITORS=$(monitors_json)
+  [[ -n $MONITORS ]] || return 1
+  INTERNAL=$(jq -r '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0].name // ""' <<<"$MONITORS")
+  EXTERNAL=$(jq -r '[.[] | select(.name | test("^(eDP|LVDS|DSI|HEADLESS|FALLBACK)") | not)][0].name // ""' <<<"$MONITORS")
+  [[ $INTERNAL =~ $SAFE_NAME ]] || INTERNAL=""
+  [[ $EXTERNAL =~ $SAFE_NAME ]] || EXTERNAL=""
+  INTERNAL_OUT=$(output_for "$INTERNAL")
+  EXTERNAL_OUT=$(output_for "$EXTERNAL")
+}
+
+output_for() {
+  local name=$1 desc
+  [[ -n $name ]] || return 0
+  desc=$(jq -r --arg n "$name" '[.[] | select(.name == $n)][0].description // ""' <<<"$MONITORS")
+  if [[ $desc =~ $SAFE_DESC ]]; then
+    echo "desc:$desc"
+  else
+    echo "$name"
+  fi
+}
+
+desired_mode() {
+  local mode=""
+  [[ -r $MODE_FILE ]] && mode=$(<"$MODE_FILE")
+  case "$mode" in
+    internal | duplicate | extend | external) echo "$mode" ;;
+    *) echo "" ;;
+  esac
+}
+
+desired_strategy() {
+  local strategy=""
+  [[ -r $STRATEGY_FILE ]] && strategy=$(<"$STRATEGY_FILE")
+  [[ $strategy == external ]] && echo external || echo common
+}
+
+common_modes() {
+  jq -r --arg i "$INTERNAL" --arg e "$EXTERNAL" '
+    def modes($n):
+      [.[] | select(.name == $n) | .availableModes[]
+        | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)Hz$")
+        | {res: "\(.w)x\(.h)", area: ((.w | tonumber) * (.h | tonumber)), w: (.w | tonumber), r: .r}];
+    def best($res): map(select(.res == $res)) | min_by((.r | tonumber) - 60 | fabs);
+    modes($i) as $a | modes($e) as $b
+    | [$a[] | select(.res as $r | any($b[]; .res == $r))]
+    | sort_by(.area, .w) | last
+    | if . == null then empty
+      else .res as $res | "\($res)@\($a | best($res) | .r) \($res)@\($b | best($res) | .r)"
+      end
+  ' <<<"$MONITORS"
+}
+
+saver_rule() {
+  printf 'hl.window_rule({ match = { class = "^%s$" }, workspace = "special:%s silent", no_focus = true, no_dim = true, border_size = 0, rounding = 0, no_shadow = true, no_anim = true })\n' "${SAVER_CLASS//./\\\\.}" "$SAVER_WORKSPACE"
+}
+
+generate() {
+  local mode=$1 strategy=$2
+
+  echo "-- Generado por el plugin aldo.display-mode. No editar: se reescribe solo."
+  if [[ -z $mode || -z $INTERNAL || -z $EXTERNAL ]]; then
+    echo "-- Sin modo activo (falta elegirlo o no hay segunda pantalla conectada)."
+    return
+  fi
+
+  echo "-- Modo: $mode"
+  case "$mode" in
+    internal)
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1 })\n' "$INTERNAL_OUT"
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "%sx%s", scale = 1 })\n' "$EXTERNAL_OUT" "$PARKED" "$PARKED"
+      printf 'hl.workspace_rule({ workspace = "name:%s", monitor = "%s", default = true, persistent = true })\n' "$SAVER_WORKSPACE" "$EXTERNAL"
+      printf 'for i = 1, 10 do hl.workspace_rule({ workspace = tostring(i), monitor = "%s" }) end\n' "$INTERNAL"
+      saver_rule
+      ;;
+    external)
+      printf 'hl.monitor({ output = "%s", disabled = true })\n' "$INTERNAL_OUT"
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1 })\n' "$EXTERNAL_OUT"
+      ;;
+    extend)
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1 })\n' "$INTERNAL_OUT"
+      printf 'hl.monitor({ output = "%s", mode = "preferred", position = "auto-right", scale = 1 })\n' "$EXTERNAL_OUT"
+      printf 'hl.workspace_rule({ workspace = "%s", monitor = "%s", default = true })\n' "$EXTERNAL_WORKSPACE" "$EXTERNAL"
+      ;;
+    duplicate)
+      local common internal_mode="preferred" external_mode="preferred"
+      echo 'hl.config({ cursor = { no_hardware_cursors = 1 } })'
+      if [[ $strategy == external ]]; then
+        printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1 })\n' "$EXTERNAL_OUT"
+        printf 'hl.monitor({ output = "%s", mode = "preferred", position = "0x0", scale = 1, mirror = "%s" })\n' "$INTERNAL_OUT" "$EXTERNAL"
+      else
+        common=$(common_modes)
+        if [[ $common =~ ^([0-9]+x[0-9]+@[0-9.]+)\ ([0-9]+x[0-9]+@[0-9.]+)$ ]]; then
+          internal_mode=${BASH_REMATCH[1]}
+          external_mode=${BASH_REMATCH[2]}
+        fi
+        printf 'hl.monitor({ output = "%s", mode = "%s", position = "0x0", scale = 1 })\n' "$INTERNAL_OUT" "$internal_mode"
+        printf 'hl.monitor({ output = "%s", mode = "%s", position = "0x0", scale = 1, mirror = "%s" })\n' "$EXTERNAL_OUT" "$external_mode" "$INTERNAL"
+      fi
+      ;;
+  esac
+}
+
+SHIM="$TOGGLES/internal-monitor-mirror.lua"
+SHIM_MARK="-- aldo.display-mode"
+
+shim_is_ours() {
+  [[ -r $SHIM ]] && grep -qF -- "$SHIM_MARK" "$SHIM"
+}
+
+sync_shim() {
+  local wanted=$1
+  if [[ $wanted == on ]]; then
+    shim_is_ours && return 1
+    mkdir -p "$TOGGLES"
+    printf '%s\n%s\n' "$SHIM_MARK: aplica el modo de pantalla elegido en la barra." \
+      'dofile(os.getenv("HOME") .. "/.config/hypr/display-mode.lua")' >"$SHIM"
+    return 0
+  fi
+  shim_is_ours || return 1
+  rm -f "$SHIM"
+  return 0
+}
+
+saver_running() {
+  pgrep -f -- "[-]-(class|app-id)=$SAVER_CLASS" >/dev/null
+}
+
+saver_start() {
+  local self terminal command
+  saver_running && return 0
+  self=$(realpath "$0")
+  terminal=$(xdg-terminal-exec --print-id 2>/dev/null)
+
+  case $terminal in
+    *Alacritty*) set -- alacritty --class="$SAVER_CLASS" --config-file "$OMARCHY_PATH/default/alacritty/screensaver.toml" -e "$self" saver-run ;;
+    *ghostty*) set -- ghostty --class="$SAVER_CLASS" --config-file="$OMARCHY_PATH/default/ghostty/screensaver" --font-size=18 --cursor-opacity=0 --scrollbar=never -e "$self" saver-run ;;
+    *foot*) set -- foot --app-id="$SAVER_CLASS" --config="$OMARCHY_PATH/default/foot/screensaver.ini" -e "$self" saver-run ;;
+    *kitty*) set -- kitty --class="$SAVER_CLASS" --override font_size=18 --override window_padding_width=0 -e "$self" saver-run ;;
+    *) return 1 ;;
+  esac
+
+  printf -v command '%q ' "$@"
+  hyprctl dispatch "hl.dsp.exec_cmd([[$command]])" >/dev/null 2>&1
+
+  local deadline=$((SECONDS + 5))
+  while ((SECONDS < deadline)) && ! saver_running; do sleep 0.1; done
+}
+
+saver_stop() {
+  pkill -f "[-]-(class|app-id)=$SAVER_CLASS" 2>/dev/null
+  return 0
+}
+
+saver_run() {
+  printf '\033]11;rgb:00/00/00\007\033[?25l'
+  stty -echo -icanon 2>/dev/null
+  local deadline=$((SECONDS + 2))
+  while ((SECONDS < deadline)) && [[ $(stty size 2>/dev/null) == "24 80" ]]; do sleep 0.02; done
+
+  while true; do
+    ttfx -i ~/.config/omarchy/branding/screensaver.txt \
+      --frame-rate 60 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c \
+      --random-effect --no-eol --no-restore-cursor || sleep 2
+  done
+}
+
+dispatch() {
+  hyprctl dispatch "$1" >/dev/null 2>&1
+}
+
+place_saver() {
+  local mode=$1 clients monitors saver address home ws_id ws_name target window
+  [[ $mode == internal && -n $INTERNAL && -n $EXTERNAL ]] || return 0
+
+  clients=$(hyprctl clients -j 2>/dev/null)
+  monitors=$(hyprctl monitors -j 2>/dev/null)
+  read -r ws_id ws_name < <(jq -r --arg e "$EXTERNAL" '.[] | select(.name == $e) | "\(.activeWorkspace.id) \(.activeWorkspace.name)"' <<<"$monitors" 2>/dev/null)
+  [[ $ws_id =~ ^-?[0-9]+$ ]] || return 0
+  home=$(jq -r --arg i "$INTERNAL" '.[] | select(.name == $i) | .activeWorkspace.id' <<<"$monitors")
+
+  if [[ $home =~ ^[0-9]+$ ]]; then
+    while read -r window; do
+      dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"unset\", window = \"address:$window\" })"
+      dispatch "hl.dsp.window.move({ workspace = \"$home\", follow = false, window = \"address:$window\" })"
+    done < <(jq -r --arg c "$SAVER_CLASS" --argjson ws "$ws_id" '.[] | select(.workspace.id == $ws and .class != $c) | .address' <<<"$clients")
+  fi
+
+  if [[ $(jq -r '.[] | select(.focused) | .name' <<<"$monitors") == "$EXTERNAL" ]]; then
+    dispatch "hl.dsp.focus({ monitor = \"$INTERNAL\" })"
+  fi
+
+  saver=$(jq -c --arg c "$SAVER_CLASS" '[.[] | select(.class == $c)][0] // empty' <<<"$clients" 2>/dev/null)
+  [[ -n $saver ]] || return 0
+  address=$(jq -r '.address' <<<"$saver")
+
+  if [[ $(jq -r '.workspace.id' <<<"$saver") != "$ws_id" ]]; then
+    (( ws_id > 0 )) && target=$ws_id || target="name:$ws_name"
+    dispatch "hl.dsp.window.move({ workspace = \"$target\", follow = false, window = \"address:$address\" })"
+    dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"set\", window = \"address:$address\" })"
+  elif [[ $(jq -r '.fullscreen' <<<"$saver") != 2 ]]; then
+    dispatch "hl.dsp.window.fullscreen({ mode = \"fullscreen\", action = \"set\", window = \"address:$address\" })"
+  fi
+  return 0
+}
+
+show_workspace() {
+  local monitor=$1 workspace=$2
+  dispatch "hl.dsp.focus({ monitor = \"$monitor\" })"
+  dispatch "hl.dsp.focus({ workspace = \"$workspace\" })"
+}
+
+focus_internal() {
+  local previous=$1 focused active
+  focused=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
+  [[ $focused == "$INTERNAL" ]] || dispatch "hl.dsp.focus({ monitor = \"$INTERNAL\" })"
+
+  active=$(hyprctl monitors -j | jq -r --arg i "$INTERNAL" '.[] | select(.name == $i) | .activeWorkspace.id')
+  if [[ $previous =~ ^[0-9]+$ && $active != "$previous" ]] &&
+    hyprctl workspaces -j | jq -e --argjson p "$previous" --arg i "$INTERNAL" 'any(.[]; .id == $p and .monitor == $i)' >/dev/null; then
+    dispatch "hl.dsp.focus({ workspace = \"$previous\" })"
+  fi
+}
+
+sync_saver() {
+  local mode=$1 previous=${2:-} changed=${3:-0} id active
+  [[ -n $INTERNAL && -n $EXTERNAL ]] || { saver_stop; return 0; }
+
+  if [[ $mode != duplicate ]]; then
+    local deadline=$((SECONDS + 8))
+    while ((SECONDS < deadline)) &&
+      ! hyprctl monitors -j 2>/dev/null | jq -e --arg e "$EXTERNAL" 'any(.[]; .name == $e)' >/dev/null 2>&1; do
+      sleep 0.2
+    done
+  fi
+  active=$(hyprctl monitors -j | jq -r --arg e "$EXTERNAL" '.[] | select(.name == $e) | .activeWorkspace.name')
+
+  case "$mode" in
+    internal)
+      while read -r id; do
+        dispatch "hl.dsp.workspace.move({ workspace = \"$id\", monitor = \"$INTERNAL\" })"
+      done < <(hyprctl workspaces -j | jq -r --arg e "$EXTERNAL" '.[] | select(.monitor == $e and .id > 0) | .id')
+
+      saver_start
+      [[ $active == "$SAVER_WORKSPACE" ]] || show_workspace "$EXTERNAL" "name:$SAVER_WORKSPACE"
+      focus_internal "$previous"
+      ;;
+    extend)
+      saver_stop
+      if (( changed )) || [[ $active == "$SAVER_WORKSPACE" ]]; then
+        while read -r id; do
+          dispatch "hl.dsp.workspace.move({ workspace = \"$id\", monitor = \"$INTERNAL\" })"
+        done < <(hyprctl workspaces -j | jq -r --arg e "$EXTERNAL" --argjson keep "$EXTERNAL_WORKSPACE" '.[] | select(.monitor == $e and .id > 0 and .id != $keep) | .id')
+        dispatch "hl.dsp.workspace.move({ workspace = \"$EXTERNAL_WORKSPACE\", monitor = \"$EXTERNAL\" })"
+        active=$(hyprctl monitors -j | jq -r --arg e "$EXTERNAL" '.[] | select(.name == $e) | .activeWorkspace.name')
+        [[ $active == "$EXTERNAL_WORKSPACE" ]] || show_workspace "$EXTERNAL" "$EXTERNAL_WORKSPACE"
+        focus_internal "$previous"
+      fi
+      ;;
+    external)
+      saver_stop
+      if [[ $active == "$SAVER_WORKSPACE" && $previous =~ ^[0-9]+$ ]]; then
+        dispatch "hl.dsp.focus({ workspace = \"$previous\" })"
+      fi
+      ;;
+    *) saver_stop ;;
+  esac
+
+  place_saver "$mode"
+  return 0
+}
+
+ensure_visible() {
+  local mode=$1
+  [[ $mode == internal || $mode == extend || $mode == external ]] || return 0
+  [[ -n $EXTERNAL ]] && command -v grim >/dev/null || return 0
+  grim -o "$EXTERNAL" -t ppm - >/dev/null 2>&1 && return 0
+
+  hyprctl eval "hl.monitor({ output = \"$EXTERNAL_OUT\", disabled = true })" >/dev/null 2>&1
+  sleep 1
+  hyprctl reload >/dev/null 2>&1
+  sleep 2
+}
+
+apply() {
+  local next mode previous changed=0
+  detect || return 1
+  mode=$(desired_mode)
+  next=$(generate "$mode" "$(desired_strategy)")
+
+  if [[ ! -r $LUA_FILE || $(<"$LUA_FILE") != "$next" ]]; then
+    printf '%s\n' "$next" >"$LUA_FILE.tmp" && mv "$LUA_FILE.tmp" "$LUA_FILE"
+    changed=1
+  fi
+
+  if [[ -n $mode && -n $INTERNAL && -n $EXTERNAL ]]; then
+    sync_shim on && changed=1
+  else
+    sync_shim off && changed=1
+  fi
+
+  previous=$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')
+  if (( changed )); then
+    hyprctl reload >/dev/null 2>&1
+    sleep 1.5
+  fi
+  [[ -n $mode ]] && ensure_visible "$mode"
+  sync_saver "$mode" "$previous" "$changed"
+  return 0
+}
+
+replace_saver() {
+  detect || return 0
+  place_saver "$(desired_mode)"
+}
+
+with_lock() {
+  (
+    flock -w 10 9 || exit 1
+    "$@"
+  ) 9>"$LOCK"
+}
+
+status() {
+  local desired current
+  detect || { echo '{"mode":"internal","desired":"","external":false}'; return; }
+  desired=$(desired_mode)
+
+  current=$(jq -r --arg i "$INTERNAL" --arg e "$EXTERNAL" --argjson parked "$PARKED" '
+    (map(select(.name == $i))[0]) as $in | (map(select(.name == $e))[0]) as $ex
+    | if $ex == null then "internal"
+      elif $in == null then "external"
+      elif $in.disabled then "external"
+      elif $ex.disabled then "internal"
+      elif ($ex.mirrorOf != "none" or $in.mirrorOf != "none") then "duplicate"
+      elif $ex.x >= $parked then "internal"
+      else "extend" end
+  ' <<<"$MONITORS")
+
+  jq -cn --arg mode "$current" --arg desired "$desired" --arg strategy "$(desired_strategy)" \
+    --arg internal "$INTERNAL" --arg external "$EXTERNAL" \
+    '{mode: $mode, desired: $desired, strategy: $strategy, internal: $internal, external: $external,
+      hasInternal: ($internal != ""), hasExternal: ($external != "")}'
+}
+
+HYPR_CONFIG="$HOME/.config/hypr/hyprland.lua"
+
+ensure_hook() {
+  [[ -f $HYPR_CONFIG ]] || return 0
+  grep -qF '/.config/hypr/display-mode.lua' "$HYPR_CONFIG" && return 0
+  cat >>"$HYPR_CONFIG" <<'LUA'
+
+-- BEGIN aldo.display-mode: the display mode picked in the bar loads last, over any other monitor rule.
+do local path = os.getenv("HOME") .. "/.config/hypr/display-mode.lua"; local file = io.open(path, "r"); if file then file:close(); dofile(path) end end
+-- END aldo.display-mode
+LUA
+}
+
+set_mode() {
+  local mode=${1:-} strategy=${2:-}
+  case "$mode" in
+    internal | duplicate | extend | external) ;;
+    *)
+      echo "Uso: display-mode set <internal|duplicate|extend|external> [common|external]" >&2
+      exit 1
+      ;;
+  esac
+
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$mode" >"$MODE_FILE"
+  case "$strategy" in
+    common | external) printf '%s\n' "$strategy" >"$STRATEGY_FILE" ;;
+  esac
+
+  shim_is_ours || rm -f "$SHIM"
+  rm -f "$TOGGLES/internal-monitor-disable.lua"
+
+  ensure_hook
+  apply
+}
+
+watch() {
+  local socket="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+  with_lock apply
+  echo changed
+
+  while read -r event; do
+    case "$event" in
+      monitoradded\>\>* | monitorremoved\>\>*)
+        sleep 1
+        with_lock apply
+        echo changed
+        ;;
+      configreloaded\>\>*)
+        echo changed
+        ;;
+      openwindow\>\>* | closewindow\>\>* | movewindowv2\>\>* | workspacev2\>\>* | moveworkspacev2\>\>* | focusedmonv2\>\>*)
+        with_lock replace_saver
+        ;;
+    esac
+  done < <(socat -U - "UNIX-CONNECT:$socket")
+}
+
+case "${1:-}" in
+  status) status ;;
+  set)
+    shift
+    with_lock set_mode "$@"
+    ;;
+  reconcile) with_lock apply ;;
+  watch) watch ;;
+  saver-run) saver_run ;;
+  *)
+    echo "Uso: display-mode {status|set <modo> [estrategia]|reconcile|watch}" >&2
+    exit 1
+    ;;
+esac

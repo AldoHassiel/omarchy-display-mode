@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "aldo.display-mode",
+  "name": "Display Mode",
+  "version": "1.0.0",
+  "author": "Aldo Hassiel Acosta Espinoza",
+  "license": "MIT",
+  "description": "Win+P style display switcher: laptop only, duplicate, extend, or second screen only, from four keyboard-friendly cards in the bar.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Display Mode",
+    "description": "Switch between laptop only, duplicate, extend, and second screen only",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd"
+  }
+}
